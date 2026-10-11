@@ -1,0 +1,158 @@
+name: destroy-infra
+
+# Este pipeline BORRA el laboratorio. No se dispara con push:
+# una correccion del README no debe destruir la infraestructura.
+# Solo se ejecuta a mano y exige escribir DESTRUIR para confirmar.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmar:
+        description: 'Escribe DESTRUIR para confirmar el borrado del laboratorio'
+        required: true
+        default: ''
+
+env:
+  RG: rg-cardops-demo
+  APIM_NAME: apim-cardops-demo
+  APIM_LOCATION: eastus
+  AKS_NAME: aks-cardops-demo
+  COSMOS_ACCOUNT: cosmos-cardops-demo
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    # El borrado del Resource Group con APIM dentro tarda entre 30 y 50 min.
+    # Esperamos de verdad, porque si no la validacion final no valida nada.
+    timeout-minutes: 120
+
+    steps:
+      # =====================================
+      # Confirmacion explicita
+      # =====================================
+      - name: Verificar confirmacion
+        run: |
+          if [ "${{ inputs.confirmar }}" != "DESTRUIR" ]; then
+            echo "::error::Confirmacion incorrecta. Escribe exactamente DESTRUIR."
+            exit 1
+          fi
+          echo "Confirmacion aceptada."
+
+      # =====================================
+      # Azure login
+      # =====================================
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # =====================================
+      # Inventario previo: que vamos a borrar
+      # =====================================
+      - name: Inventario antes de borrar
+        run: |
+          if [ "$(az group exists --name "$RG")" = "false" ]; then
+            echo "El Resource Group $RG no existe. Nada que borrar."
+            exit 0
+          fi
+          echo "Recursos en $RG:"
+          az resource list --resource-group "$RG" \
+            --query "[].{nombre:name, tipo:type, region:location}" -o table
+
+      # =====================================
+      # Borrado del Resource Group, esperando a que termine
+      # =====================================
+      # Sin --no-wait. Con --no-wait el comando vuelve en un segundo,
+      # APIM todavia no esta en soft delete y el purge siguiente no
+      # encuentra nada que purgar: el nombre queda reservado 48 h.
+      - name: Borrar Resource Group (AKS + APIM + Cosmos)
+        run: |
+          if [ "$(az group exists --name "$RG")" = "false" ]; then
+            echo "El Resource Group $RG no existe."
+            exit 0
+          fi
+          echo "Borrando $RG. Esto tarda entre 30 y 50 min por APIM."
+          az group delete --name "$RG" --yes
+          echo "Resource Group borrado."
+
+      # =====================================
+      # Resource Group de nodos de AKS
+      # =====================================
+      # AKS crea MC_<rg>_<aks>_<region> con los nodos, discos y la IP
+      # publica del ingress. Normalmente cae al borrar el RG padre;
+      # si el borrado de AKS falla queda huerfano y sigue facturando.
+      - name: Comprobar Resource Group de nodos (MC_)
+        run: |
+          MC=$(az group list --query "[?starts_with(name,'MC_${RG}_')].name" -o tsv)
+          if [ -z "$MC" ]; then
+            echo "No quedan Resource Groups MC_ huerfanos."
+          else
+            for g in $MC; do
+              echo "Encontrado RG de nodos huerfano: $g. Borrando."
+              az group delete --name "$g" --yes
+            done
+          fi
+
+      # =====================================
+      # Purga del soft delete de APIM
+      # =====================================
+      # APIM queda en soft delete 48 h aunque borres el RG. Mientras
+      # siga ahi, el nombre apim-cardops-demo no se puede reutilizar.
+      # No factura, pero bloquea volver a montar el laboratorio.
+      #
+      # Este comando actua a nivel de SUSCRIPCION, no del RG, asi que
+      # un Service Principal con Contributor solo en el RG recibe 403.
+      # Por eso no corta el pipeline: informa y deja el comando listo.
+      - name: Purgar APIM en soft delete
+        continue-on-error: true
+        run: |
+          echo "Servicios APIM en soft delete:"
+          az apim deletedservice list -o table 2>/dev/null || echo "  (sin permiso para listar)"
+
+          if az apim deletedservice purge \
+               --service-name "$APIM_NAME" \
+               --location "$APIM_LOCATION" \
+               --only-show-errors; then
+            echo "APIM purgado. El nombre $APIM_NAME queda libre."
+          else
+            echo "::warning::No se pudo purgar APIM automaticamente."
+            echo "Si el error es de permisos, ejecutalo en Cloud Shell:"
+            echo "  az apim deletedservice purge --service-name $APIM_NAME --location $APIM_LOCATION"
+            echo "Si el error dice que no existe, no hay nada en soft delete."
+          fi
+
+      # =====================================
+      # Validacion final
+      # =====================================
+      - name: Validacion final
+        run: |
+          FALLOS=0
+
+          if [ "$(az group exists --name "$RG")" = "true" ]; then
+            echo "FALTA: el Resource Group $RG todavia existe."
+            FALLOS=$((FALLOS+1))
+          else
+            echo "OK: Resource Group $RG borrado."
+          fi
+
+          MC=$(az group list --query "[?starts_with(name,'MC_${RG}_')].name" -o tsv)
+          if [ -n "$MC" ]; then
+            echo "FALTA: quedan Resource Groups de nodos: $MC"
+            FALLOS=$((FALLOS+1))
+          else
+            echo "OK: sin Resource Groups de nodos."
+          fi
+
+          SOFT=$(az apim deletedservice list --query "[?name=='${APIM_NAME}'].name" -o tsv 2>/dev/null || echo "sin-permiso")
+          if [ "$SOFT" = "sin-permiso" ]; then
+            echo "AVISO: sin permiso para comprobar el soft delete de APIM. Revisalo a mano."
+          elif [ -n "$SOFT" ]; then
+            echo "AVISO: $APIM_NAME sigue en soft delete. No factura, pero el nombre esta reservado."
+          else
+            echo "OK: sin APIM en soft delete."
+          fi
+
+          if [ "$FALLOS" -gt 0 ]; then
+            echo "::error::Quedan recursos sin borrar. Revisa los mensajes anteriores."
+            exit 1
+          fi
+          echo "Laboratorio en cero: no quedan recursos facturables."

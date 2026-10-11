@@ -1,0 +1,16 @@
+# IDE
+.idea/
+.vs/
+*.iml
+*.suo
+*.user
+
+# Azure CLI / credenciales
+*.publishsettings
+azureauth.json
+*credentials*.json
+.azure/
+
+# Logs y temporales
+*.log
+*.tmp
