@@ -28,18 +28,50 @@ El pipeline **no se dispara con push**. Se ejecuta a mano:
 2. En el campo `confirmar`, escribir exactamente `DESTRUIR`.
 3. **Run workflow**.
 
-Tarda entre 30 y 50 minutos: APIM es el recurso lento. El job espera a que termine
-de verdad, así la validación final significa algo.
+Tarda entre 10 y 50 minutos según la carga de la región: APIM es el recurso lento.
+El job espera a que Azure termine de verdad, no solo a que acepte la petición.
 
-### Desde Cloud Shell
+Cuando acabe, el resumen del job indica los comandos de verificación pendientes.
+
+### Cerrar el teardown (obligatorio)
+
+El pipeline solo puede borrar el Resource Group. **Lo que queda fuera de ese RG hay
+que comprobarlo con una cuenta de usuario** — ver la sección siguiente. En Cloud Shell:
+
+```powershell
+./verificar.ps1
+```
+
+Comprueba el RG, borra el `MC_` si quedó huérfano, purga el soft delete de APIM y
+hace un barrido final por nombre.
+
+### Todo a mano, sin pipeline
 
 ```powershell
 az login
 az account set --subscription "<id de la suscripción>"
-./destroy.ps1
+./destroy.ps1      # borra el RG; -Force para no preguntar
+./verificar.ps1    # cierra y confirma
 ```
 
-Pide confirmación. Con `-Force` no pregunta.
+## Por qué hacen falta dos pasos
+
+El Service Principal tiene Contributor **solo sobre `rg-cardops-demo`**. En cuanto
+el pipeline borra ese Resource Group, desaparece también su asignación de rol,
+porque estaba al ámbito de ese RG. A partir de ese instante el SP no tiene **ningún**
+permiso en la suscripción: ni siquiera `Microsoft.Resources/subscriptions/resourceGroups/read`.
+
+Todo lo que queda por comprobar vive fuera del RG borrado:
+
+| Qué | Dónde vive | Quién puede |
+|---|---|---|
+| `rg-cardops-demo` | Resource Group | el SP (hasta borrarlo) |
+| `MC_rg-cardops-demo_…` | **otro** Resource Group | cuenta con lectura de suscripción |
+| Soft delete de APIM | ámbito de **suscripción** | cuenta con permisos de suscripción |
+
+Por eso el pipeline borra y `verificar.ps1` cierra. La alternativa sería dar Reader
+al SP sobre toda la suscripción: para un laboratorio, un comando manual al resetear
+es menos superficie de permisos que un rol permanente sobre todo.
 
 ## El soft delete de APIM
 
@@ -47,20 +79,13 @@ API Management no se borra del todo: queda **48 horas en soft delete**. No factu
 pero el nombre `apim-cardops-demo` sigue reservado y no se puede volver a montar el
 laboratorio con el mismo nombre hasta purgarlo.
 
-Purgarlo es una operación **a nivel de suscripción**, no del Resource Group. El
-Service Principal del laboratorio tiene Contributor solo sobre `rg-cardops-demo`,
-así que recibe **403** en este paso. El pipeline no se corta por eso: avisa y deja
-el comando listo para ejecutarlo a mano.
+Purgarlo es una operación **a nivel de suscripción**, no del Resource Group, así que
+el Service Principal recibe 403. Lo hace `verificar.ps1`, o a mano:
 
 ```bash
 az apim deletedservice list -o table
 az apim deletedservice purge --service-name apim-cardops-demo --location eastus
 ```
-
-Para automatizarlo habría que dar al Service Principal un rol a nivel de
-suscripción con la acción `Microsoft.ApiManagement/locations/deletedservices/delete`.
-Para un laboratorio no vale la pena: un comando manual cada vez que se resetea es
-menos superficie de permisos que un rol permanente sobre toda la suscripción.
 
 ## Después del teardown
 

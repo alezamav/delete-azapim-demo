@@ -15,14 +15,30 @@ env:
   RG: rg-cardops-demo
   APIM_NAME: apim-cardops-demo
   APIM_LOCATION: eastus
-  AKS_NAME: aks-cardops-demo
-  COSMOS_ACCOUNT: cosmos-cardops-demo
+
+# -----------------------------------------------------------------------------
+# ALCANCE DE ESTE PIPELINE
+#
+# El Service Principal tiene Contributor SOLO sobre rg-cardops-demo. Al borrar
+# ese Resource Group desaparece tambien su asignacion de rol, porque estaba al
+# ambito de ese RG. A partir de ese momento el SP no tiene ningun permiso en la
+# suscripcion: ni siquiera resourceGroups/read.
+#
+# Por eso este pipeline hace una sola cosa: borrar el RG. Todo lo que hay que
+# comprobar despues (el RG de nodos MC_, el soft delete de APIM) vive fuera de
+# ese RG y requiere permisos de suscripcion, asi que se verifica con
+# verificar.ps1 desde Cloud Shell con una cuenta de usuario.
+#
+# La alternativa seria dar Reader al SP sobre toda la suscripcion. Para un
+# laboratorio no compensa: un comando manual al resetear es menos superficie
+# de permisos que un rol permanente sobre todo.
+# -----------------------------------------------------------------------------
 
 jobs:
   destroy:
     runs-on: ubuntu-latest
-    # El borrado del Resource Group con APIM dentro tarda entre 30 y 50 min.
-    # Esperamos de verdad, porque si no la validacion final no valida nada.
+    # El borrado del RG con APIM dentro tarda entre 10 y 50 min segun la carga
+    # de la region. Esperamos de verdad: con --no-wait la validacion no valida.
     timeout-minutes: 120
 
     steps:
@@ -40,119 +56,97 @@ jobs:
       # =====================================
       # Azure login
       # =====================================
+      # allow-no-subscriptions: cuando el laboratorio ya esta destruido, el SP
+      # se quedo sin asignacion de rol y no ve ninguna suscripcion. Sin esta
+      # opcion la accion falla con "No subscriptions found" y el pipeline sale
+      # en rojo, cuando en realidad el estado es el correcto: no hay nada que
+      # destruir. Con ella el login pasa y lo decide el paso siguiente.
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+          allow-no-subscriptions: true
 
       # =====================================
-      # Inventario previo: que vamos a borrar
+      # Hay algo que destruir?
       # =====================================
-      - name: Inventario antes de borrar
+      - name: Comprobar si queda laboratorio
+        id: estado
         run: |
-          if [ "$(az group exists --name "$RG")" = "false" ]; then
-            echo "El Resource Group $RG no existe. Nada que borrar."
+          N=$(az account list --query "length(@)" -o tsv 2>/dev/null || echo 0)
+          if [ "$N" = "0" ]; then
+            echo "El Service Principal no tiene acceso a ninguna suscripcion."
+            echo "Esto es lo normal cuando el laboratorio ya esta destruido: al"
+            echo "borrar $RG desaparecio tambien su asignacion de rol."
+            echo "Nada que destruir."
+            echo "hay=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          az account set --subscription "$(az account list --query '[0].id' -o tsv)"
+
+          if [ "$(az group exists --name "$RG")" = "false" ]; then
+            echo "El Resource Group $RG no existe. Nada que destruir."
+            echo "hay=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           echo "Recursos en $RG:"
           az resource list --resource-group "$RG" \
             --query "[].{nombre:name, tipo:type, region:location}" -o table
+          echo "hay=true" >> "$GITHUB_OUTPUT"
 
       # =====================================
       # Borrado del Resource Group, esperando a que termine
       # =====================================
-      # Sin --no-wait. Con --no-wait el comando vuelve en un segundo,
-      # APIM todavia no esta en soft delete y el purge siguiente no
-      # encuentra nada que purgar: el nombre queda reservado 48 h.
+      # Sin --no-wait a proposito: queremos que el job termine cuando Azure
+      # haya terminado, no cuando haya aceptado la peticion.
       - name: Borrar Resource Group (AKS + APIM + Cosmos)
+        if: steps.estado.outputs.hay == 'true'
         run: |
-          if [ "$(az group exists --name "$RG")" = "false" ]; then
-            echo "El Resource Group $RG no existe."
-            exit 0
-          fi
-          echo "Borrando $RG. Esto tarda entre 30 y 50 min por APIM."
+          echo "Borrando $RG. Puede tardar entre 10 y 50 min por APIM."
           az group delete --name "$RG" --yes
           echo "Resource Group borrado."
 
       # =====================================
-      # Resource Group de nodos de AKS
+      # Cierre: que queda por hacer a mano
       # =====================================
-      # AKS crea MC_<rg>_<aks>_<region> con los nodos, discos y la IP
-      # publica del ingress. Normalmente cae al borrar el RG padre;
-      # si el borrado de AKS falla queda huerfano y sigue facturando.
-      - name: Comprobar Resource Group de nodos (MC_)
+      # A partir de aqui el SP ya no tiene permisos (su role assignment se fue
+      # con el RG), asi que el pipeline no intenta comprobar nada mas: imprime
+      # los comandos y termina en verde.
+      - name: Pendiente de verificacion manual
+        if: steps.estado.outputs.hay == 'true'
         run: |
-          MC=$(az group list --query "[?starts_with(name,'MC_${RG}_')].name" -o tsv)
-          if [ -z "$MC" ]; then
-            echo "No quedan Resource Groups MC_ huerfanos."
-          else
-            for g in $MC; do
-              echo "Encontrado RG de nodos huerfano: $g. Borrando."
-              az group delete --name "$g" --yes
-            done
-          fi
+          {
+            echo "## Resource Group \`$RG\` borrado"
+            echo ""
+            echo "El Service Principal perdio sus permisos al borrarse el RG"
+            echo "(su asignacion de rol estaba al ambito de ese RG), asi que el"
+            echo "resto se comprueba desde Cloud Shell con una cuenta de usuario:"
+            echo ""
+            echo '```bash'
+            echo "az group list --query \"[?contains(name,'cardops')].name\" -o tsv"
+            echo "az apim deletedservice list -o table"
+            echo "az apim deletedservice purge --service-name $APIM_NAME --location $APIM_LOCATION"
+            echo '```'
+            echo ""
+            echo "La primera debe salir vacia, incluido el RG de nodos \`MC_${RG}_...\`."
+            echo "La tercera libera el nombre \`$APIM_NAME\`, reservado 48 h por el soft delete."
+            echo ""
+            echo "O, en la misma Cloud Shell: \`./verificar.ps1\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Borrado completado. Verificacion manual pendiente (ver el resumen del job)."
 
       # =====================================
-      # Purga del soft delete de APIM
+      # Nada que destruir: salida limpia
       # =====================================
-      # APIM queda en soft delete 48 h aunque borres el RG. Mientras
-      # siga ahi, el nombre apim-cardops-demo no se puede reutilizar.
-      # No factura, pero bloquea volver a montar el laboratorio.
-      #
-      # Este comando actua a nivel de SUSCRIPCION, no del RG, asi que
-      # un Service Principal con Contributor solo en el RG recibe 403.
-      # Por eso no corta el pipeline: informa y deja el comando listo.
-      - name: Purgar APIM en soft delete
-        continue-on-error: true
+      - name: Laboratorio ya en cero
+        if: steps.estado.outputs.hay != 'true'
         run: |
-          echo "Servicios APIM en soft delete:"
-          az apim deletedservice list -o table 2>/dev/null || echo "  (sin permiso para listar)"
-
-          if az apim deletedservice purge \
-               --service-name "$APIM_NAME" \
-               --location "$APIM_LOCATION" \
-               --only-show-errors; then
-            echo "APIM purgado. El nombre $APIM_NAME queda libre."
-          else
-            echo "::warning::No se pudo purgar APIM automaticamente."
-            echo "Si el error es de permisos, ejecutalo en Cloud Shell:"
-            echo "  az apim deletedservice purge --service-name $APIM_NAME --location $APIM_LOCATION"
-            echo "Si el error dice que no existe, no hay nada en soft delete."
-          fi
-
-      # =====================================
-      # Validacion final
-      # =====================================
-      - name: Validacion final
-        run: |
-          FALLOS=0
-
-          if [ "$(az group exists --name "$RG")" = "true" ]; then
-            echo "FALTA: el Resource Group $RG todavia existe."
-            FALLOS=$((FALLOS+1))
-          else
-            echo "OK: Resource Group $RG borrado."
-          fi
-
-          MC=$(az group list --query "[?starts_with(name,'MC_${RG}_')].name" -o tsv)
-          if [ -n "$MC" ]; then
-            echo "FALTA: quedan Resource Groups de nodos: $MC"
-            FALLOS=$((FALLOS+1))
-          else
-            echo "OK: sin Resource Groups de nodos."
-          fi
-
-          SOFT=$(az apim deletedservice list --query "[?name=='${APIM_NAME}'].name" -o tsv 2>/dev/null || echo "sin-permiso")
-          if [ "$SOFT" = "sin-permiso" ]; then
-            echo "AVISO: sin permiso para comprobar el soft delete de APIM. Revisalo a mano."
-          elif [ -n "$SOFT" ]; then
-            echo "AVISO: $APIM_NAME sigue en soft delete. No factura, pero el nombre esta reservado."
-          else
-            echo "OK: sin APIM en soft delete."
-          fi
-
-          if [ "$FALLOS" -gt 0 ]; then
-            echo "::error::Quedan recursos sin borrar. Revisa los mensajes anteriores."
-            exit 1
-          fi
-          echo "Laboratorio en cero: no quedan recursos facturables."
+          {
+            echo "## Nada que destruir"
+            echo ""
+            echo "El laboratorio ya estaba en cero. El pipeline no hizo cambios."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Nada que destruir. El pipeline no hizo cambios."
