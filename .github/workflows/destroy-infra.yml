@@ -56,16 +56,22 @@ jobs:
       # =====================================
       # Azure login
       # =====================================
-      # allow-no-subscriptions: cuando el laboratorio ya esta destruido, el SP
-      # se quedo sin asignacion de rol y no ve ninguna suscripcion. Sin esta
-      # opcion la accion falla con "No subscriptions found" y el pipeline sale
-      # en rojo, cuando en realidad el estado es el correcto: no hay nada que
-      # destruir. Con ella el login pasa y lo decide el paso siguiente.
+      # continue-on-error: cuando el laboratorio ya esta destruido, el SP se
+      # quedo sin asignacion de rol y la suscripcion deja de ser visible para
+      # el. La accion falla entonces con "The subscription ... doesn't exist in
+      # cloud 'AzureCloud'", porque el JSON de credenciales nombra una
+      # suscripcion que el SP ya no puede ver.
+      #
+      # Eso no es una averia: es exactamente el estado al que queriamos llegar.
+      # Dejamos que el login falle sin cortar el job y que el paso siguiente
+      # decida. allow-no-subscriptions NO sirve aqui: solo aplica si el JSON no
+      # trae subscriptionId, y el nuestro lo trae.
       - name: Azure Login
+        id: login
+        continue-on-error: true
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-          allow-no-subscriptions: true
 
       # =====================================
       # Hay algo que destruir?
@@ -73,17 +79,20 @@ jobs:
       - name: Comprobar si queda laboratorio
         id: estado
         run: |
-          N=$(az account list --query "length(@)" -o tsv 2>/dev/null || echo 0)
-          if [ "$N" = "0" ]; then
-            echo "El Service Principal no tiene acceso a ninguna suscripcion."
+          if [ "${{ steps.login.outcome }}" != "success" ]; then
+            echo "El login fallo: el Service Principal no ve la suscripcion."
             echo "Esto es lo normal cuando el laboratorio ya esta destruido: al"
-            echo "borrar $RG desaparecio tambien su asignacion de rol."
+            echo "borrar $RG desaparecio tambien su asignacion de rol, que estaba"
+            echo "al ambito de ese Resource Group."
+            echo ""
+            echo "Si esperabas encontrar infraestructura, revisa en este orden:"
+            echo "  1. que el RG exista        -> az group exists --name $RG"
+            echo "  2. que el SP tenga el rol  -> az role assignment list --assignee <clientId> --all"
+            echo "  3. que el secreto no haya caducado (Entra ID > App registrations)"
             echo "Nada que destruir."
             echo "hay=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          az account set --subscription "$(az account list --query '[0].id' -o tsv)"
 
           if [ "$(az group exists --name "$RG")" = "false" ]; then
             echo "El Resource Group $RG no existe. Nada que destruir."
